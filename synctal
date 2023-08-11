@@ -1,0 +1,165 @@
+#!/usr/bin/env bash
+
+# This is just a single-file bash script for simple two-way sync.  First passed
+# argument is the client-side directory and second passed argument is the
+# server-side directory, as you would type it into rsync.
+# Ex. synctal ~/mydirectory andrew@192.168.1.110:/home/andrew/mydirectory.
+
+# Quick note:  If you use this incorrectly, you *can* completely wipe the
+# directory.  (See explanation of "*Very* important usage note" below.)  Just be
+# careful.
+
+# The primary purpose here is to replace Unison because Unison's dependency
+# hell, incompatibility between versions, and the requirement that both client
+# and server have it installed makes it impossible to use in the majority of
+# situations that I find myself in.
+
+# I looked at Syncthing briefly, but having to use a browser interface just
+# seems annoying (and probably not safe).  Plus it actually does way more than I
+# need.
+
+# Synctal is only needed in the client.  Synctal is pure bash, so it should run
+# out-of-the-box without any problems in any *NIX environment that has the Core
+# GNU Utils installed (and maybe Busybox, but I don't know about that).  It's
+# written with Desktop Linux, Termux, Raspberry Pi, and WSL in mind.
+
+# It does, though, have the following dependencies: ssh, rsync, find, grep,
+# sort, and diff.
+# I don't know any Linux system that does *not* have those apart from the
+# Android Terminal Emulator (which is why I use Termux).
+
+# One major disadvantage that this has against Unison is that this does
+# not currently handle conflicts, and probably never will.  There also may be
+# other features that Unison has that this doesn't that I don't know about.
+
+# This is really just something I slapped together to sync a directory on my
+# phone with my desktop, so don't expect too much.  I'm not currently willing to
+# use this on files I'm not willing to risk losing
+
+# The actual moving of files is done by rsync over ssh.  If something other than
+# ssh needs to be used or if the port needs to be changed, then the script can
+# be altered easily enough.
+
+# Be sure to include the final slashes when describing directories!  You know
+# how weird rsync can be.  Or maybe you don't.  If you don't know, rsync can be
+# weird.
+
+# *Very* important usage note:  If a directory has already been synced before
+# *and* you decide to sync it again to a different directory (presumably one
+# that's empty), everything will be deleted!  That's because it will think the
+# remote has deleted everything.  If you need to re-sync from scratch, delete
+# the .synctal-list file.  And you'll also want to rarely, if ever, directly
+# call synctal from the terminal.  Better to dump it into a script first to make
+# sure you're always calling the same thing.
+
+if [[ $# -lt 2 ]]; then
+    echo "Too few arguments."
+    exit 1
+fi
+
+srcDir=$1
+listshort=".synctal-list"
+list="$srcDir$listshort"
+
+userserv="${2%:*}"
+destDir="${2#*:}"
+
+# List all files (recursively) in a directory, ignoring the list.
+function listFiles {
+    cd "$1" && find ./ -not -path "./$listshort" -print | sort
+}
+
+# Create a .synctal-list file.
+function createList {
+    listFiles "$srcDir" > $list
+}
+# .synctal-list is key to making all of this work.  It's a snapshot of what the
+# directory looked like after the *last* synctal was run.
+
+# Print to output in special synctal color.
+function synecho {
+    printf "\033[0;32m$1\033[0m\n"
+}
+
+# Pull all files.
+function pull {
+    # Using `eval` is the only way I can get rsync to recognize $@.
+    eval "rsync -ravzuP $@ --rsh='ssh' \"$userserv:$destDir\" \"$srcDir\""
+}
+
+# Push all files.
+function push {
+    # Using `eval` is the only way I can get rsync to recognize $@.
+    eval "rsync -ravzuP $@ --rsh='ssh' \"$srcDir\" \"$userserv:$destDir\""
+}
+
+# Find files that were deleted from server.
+# This only makes since if it's run *before* any syncing is done or the
+# .synctal-list file is made.
+function listDeletedServer {
+    ssh "$userserv" "cd $destDir && find ./ -print | sort" | diff -u "$list" - | grep '^-\.'
+}
+
+# Create remote directory if it doesn't already exist.
+# *Only* call this on initialization!  (i.e., no .synctal-list file exists).
+function createRemoteDir {
+    ssh "$userserv" "mkdir -p $destDir"
+}
+
+# Find files that were deleted from client.
+# This also only makes sense if it's run *before* any syncing is done.
+function listDeletedClient {
+    listFiles "$srcDir" | diff -u "$list" - | grep '^-\.'
+}
+
+# Delete all local files in stdin.
+function deleteLocalFiles {
+    while read line; do
+        # Check if file or directory exists first, because it could have
+        # been deleted client-side already or it could have been in a
+        # directory that was already deleted.
+        if [ -e "${srcDir}${line:1}" ]; then
+            # Substring because this is coming from diff, so it has a leading
+            # "-"
+            cd "$srcDir" && rm -rf "${line:1}"
+        fi
+    done
+}
+
+# Build options to exclude files from rsync.
+function excludeFiles {
+    while read line; do
+        printf -- "--exclude '${line:3}' "
+        # Don't forget trailing space.
+    done
+}
+
+
+# If no .synctal-list exists, very simple first run.
+if [ ! -f "$list" ]; then
+    synecho "No .synctal-list file found.  Running initial synctalization."
+
+    createList
+    createRemoteDir
+    push
+    pull
+    createList
+
+    synecho "Synctalization done."
+
+    exit 1
+fi
+
+synecho "Synctalizing now."
+
+listDeletedServer | deleteLocalFiles
+
+pull "$(listDeletedClient | excludeFiles)"
+
+createList
+
+push --delete
+
+synecho "Synctalization done."
+
+printf "\n"
